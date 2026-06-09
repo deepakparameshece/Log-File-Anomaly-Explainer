@@ -1,155 +1,225 @@
+"""
+Log Parser Module
+=================
+Scans a .log file for error/anomaly indicators and extracts the primary
+error block along with a configurable context window (default ±20 lines).
+"""
+
+from __future__ import annotations
+
 import re
-from collections import deque
-from typing import List, Dict, Any, Tuple
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
 
-class LogEntry:
-    def __init__(self, line_number: int, timestamp: str, log_level: str, content: str, risk_level: str = "LOW"):
-        self.line_number = line_number
-        self.timestamp = timestamp
-        self.log_level = log_level
-        self.content = content
-        self.risk_level = risk_level
+# ---------------------------------------------------------------------------
+# Patterns that indicate an anomalous log line
+# ---------------------------------------------------------------------------
+ERROR_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"\b(CRITICAL|FATAL)\b", re.IGNORECASE),
+    re.compile(r"\bERROR\b", re.IGNORECASE),
+    re.compile(r"\bEXCEPTION\b", re.IGNORECASE),
+    re.compile(r"\bTraceback\s+\(most recent call last\)", re.IGNORECASE),
+    re.compile(r"\bSTACK\s+TRACE\b", re.IGNORECASE),
+    re.compile(r"\b(WARN(?:ING)?)\b", re.IGNORECASE),
+    # HTTP 4xx / 5xx status codes in access logs (e.g. "HTTP/1.1" 500)
+    re.compile(r'"\s+[45]\d{2}\s+'),
+    # Panic / segfault style messages
+    re.compile(r"\b(panic|segfault|killed|oom-kill|out of memory)\b", re.IGNORECASE),
+    # Timeout / connection refused patterns
+    re.compile(r"\b(timed?\s*out|connection refused|connection reset)\b", re.IGNORECASE),
+]
 
+# Severity ordering (higher = worse) used to pick the *primary* error
+SEVERITY_RANK: dict[str, int] = {
+    "fatal": 6,
+    "critical": 6,
+    "panic": 6,
+    "segfault": 6,
+    "oom-kill": 6,
+    "out of memory": 6,
+    "killed": 5,
+    "exception": 4,
+    "traceback": 4,
+    "stack trace": 4,
+    "error": 3,
+    "timed out": 2,
+    "connection refused": 2,
+    "connection reset": 2,
+    "warning": 1,
+    "warn": 1,
+    "http_4xx_5xx": 2,
+}
+
+
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
+@dataclass
+class AnomalyBlock:
+    """Represents a detected anomaly with surrounding context."""
+
+    file_path: str
+    primary_line_number: int          # 1-indexed
+    primary_line_content: str
+    context_start: int                # 1-indexed
+    context_end: int                  # 1-indexed
+    context_lines: list[str] = field(default_factory=list)
+    severity: int = 0
+    total_log_lines: int = 0
+
+    @property
+    def formatted_context(self) -> str:
+        """Return context as a numbered block ready for prompt injection."""
+        lines = []
+        for idx, line in enumerate(self.context_lines):
+            lineno = self.context_start + idx
+            marker = ">>>" if lineno == self.primary_line_number else "   "
+            lines.append(f"{marker} {lineno:>6} | {line.rstrip()}")
+        return "\n".join(lines)
+
+    @property
+    def summary(self) -> str:
+        return (
+            f"File: {self.file_path}\n"
+            f"Primary anomaly at line {self.primary_line_number} "
+            f"(context: lines {self.context_start}–{self.context_end})\n"
+            f"Severity score: {self.severity}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Core parser
+# ---------------------------------------------------------------------------
 class LogParser:
-    def __init__(self, context_lines: int = 10):
-        self.context_lines = context_lines
-        self.error_keywords = [
-            "ERROR", "CRITICAL", "EXCEPTION", "FATAL", "500 Internal Server Error"
-        ]
-        # Regex to match any of the error keywords (case-insensitive) with word boundaries
-        pattern = "|".join(r"\b" + re.escape(kw) + r"\b" for kw in self.error_keywords)
-        self.error_regex = re.compile(f"({pattern})", re.IGNORECASE)
-        
-        # Risk level mapping
-        self.risk_levels = {
-            "CRITICAL": "CRITICAL",
-            "FATAL": "CRITICAL", 
-            "ERROR": "HIGH",
-            "EXCEPTION": "HIGH",
-            "500 Internal Server Error": "HIGH",
-            "WARN": "MEDIUM",
-            "WARNING": "MEDIUM",
-            "INFO": "LOW",
-            "DEBUG": "LOW",
-            "TRACE": "LOW"
-        }
+    """
+    Reads a log file, detects all anomalous lines, picks the highest-severity
+    primary error, and returns an AnomalyBlock with ±context_window lines.
+    """
 
-    def is_error_line(self, line: str) -> bool:
-        return bool(self.error_regex.search(line))
-    
-    def extract_log_level(self, line: str) -> str:
-        """Extract log level from a line"""
-        for level in ["CRITICAL", "FATAL", "ERROR", "WARN", "WARNING", "INFO", "DEBUG", "TRACE"]:
-            if level in line.upper():
-                return level
-        return "UNKNOWN"
-    
-    def extract_timestamp(self, line: str) -> str:
-        """Extract timestamp from a line using common patterns"""
-        # Common timestamp patterns
-        patterns = [
-            r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}',  # YYYY-MM-DD HH:MM:SS
-            r'\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2}',  # MM/DD/YYYY HH:MM:SS
-            r'\w{3} \d{1,2} \d{2}:\d{2}:\d{2}',      # Mon DD HH:MM:SS
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, line)
-            if match:
-                return match.group()
-        return ""
-    
-    def determine_risk_level(self, log_level: str, content: str) -> str:
-        """Determine risk level based on log level and content"""
-        # Check for critical keywords in content
-        critical_keywords = ["crash", "shutdown", "abort", "panic", "segfault", "outofmemory"]
-        high_keywords = ["failed", "timeout", "connection refused", "access denied"]
-        
-        content_lower = content.lower()
-        
-        # Critical risk
-        if any(keyword in content_lower for keyword in critical_keywords):
-            return "CRITICAL"
-        
-        # High risk
-        if any(keyword in content_lower for keyword in high_keywords):
-            return "HIGH"
-        
-        # Use log level mapping
-        return self.risk_levels.get(log_level.upper(), "LOW")
-    
-    def parse_all_logs(self, file_path: str) -> List[LogEntry]:
-        """Parse all log entries from file"""
-        log_entries = []
-        
-        try:
-            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                for line_num, line in enumerate(f, 1):
-                    line = line.rstrip("\n")
-                    if line.strip():  # Skip empty lines
-                        timestamp = self.extract_timestamp(line)
-                        log_level = self.extract_log_level(line)
-                        risk_level = self.determine_risk_level(log_level, line)
-                        
-                        log_entries.append(LogEntry(
-                            line_number=line_num,
-                            timestamp=timestamp,
-                            log_level=log_level,
-                            content=line,
-                            risk_level=risk_level
-                        ))
-                        
-        except FileNotFoundError:
-            pass
-            
-        return log_entries
+    def __init__(self, context_window: int = 20) -> None:
+        self.context_window = context_window
 
-    def extract_error_blocks(self, file_path: str) -> List[str]:
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def parse(self, log_path: str | Path) -> Optional[AnomalyBlock]:
         """
-        Reads the file efficiently and extracts blocks containing 
-        the error line + context_lines before + context_lines after.
+        Parse *log_path* and return the primary AnomalyBlock, or None if no
+        anomaly is detected.
         """
-        blocks = []
-        try:
-            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                # Rolling buffer for the 'before' context
-                before_buffer = deque(maxlen=self.context_lines)
-                
-                # State variables for capturing the 'after' context
-                capturing = False
-                after_count = 0
-                current_block = []
-                
-                for line in f:
-                    line = line.rstrip("\n")
-                    
-                    if capturing:
-                        current_block.append(line)
-                        after_count += 1
-                        if after_count >= self.context_lines:
-                            # Finished capturing this block
-                            blocks.append("\n".join(current_block))
-                            capturing = False
-                            after_count = 0
-                            current_block = []
-                            # Note: if there's another error in the 'after' lines, 
-                            # we might miss it with this simple state machine. 
-                            # But for this scope, this is acceptable.
-                            before_buffer.clear()
-                    else:
-                        if self.is_error_line(line):
-                            capturing = True
-                            current_block = list(before_buffer)
-                            current_block.append(line)
-                            after_count = 0
-                        else:
-                            before_buffer.append(line)
-                
-                # If EOF reached while capturing
-                if capturing:
-                    blocks.append("\n".join(current_block))
-                    
-        except FileNotFoundError:
-            pass # Return empty list if file not found
-            
+        path = Path(log_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Log file not found: {log_path}")
+        if not path.is_file():
+            raise ValueError(f"Path is not a file: {log_path}")
+
+        lines = self._read_lines(path)
+        if not lines:
+            return None
+
+        candidate = self._find_primary_anomaly(lines)
+        if candidate is None:
+            return None
+
+        primary_idx, severity = candidate          # 0-indexed
+        start_idx = max(0, primary_idx - self.context_window)
+        end_idx = min(len(lines) - 1, primary_idx + self.context_window)
+
+        return AnomalyBlock(
+            file_path=str(path.resolve()),
+            primary_line_number=primary_idx + 1,   # convert to 1-indexed
+            primary_line_content=lines[primary_idx],
+            context_start=start_idx + 1,
+            context_end=end_idx + 1,
+            context_lines=lines[start_idx : end_idx + 1],
+            severity=severity,
+            total_log_lines=len(lines),
+        )
+
+    def scan_all(self, log_path: str | Path) -> list[AnomalyBlock]:
+        """
+        Return *all* detected anomaly blocks (de-duplicated by context overlap).
+        Useful for reports that need to surface multiple distinct error clusters.
+        """
+        path = Path(log_path)
+        lines = self._read_lines(path)
+        if not lines:
+            return []
+
+        anomaly_indices = self._find_all_anomalies(lines)
+        if not anomaly_indices:
+            return []
+
+        blocks: list[AnomalyBlock] = []
+        last_end = -1
+
+        for idx, severity in anomaly_indices:
+            start_idx = max(0, idx - self.context_window)
+            # Skip if this anomaly's context overlaps the previous block
+            if start_idx <= last_end:
+                continue
+            end_idx = min(len(lines) - 1, idx + self.context_window)
+            blocks.append(
+                AnomalyBlock(
+                    file_path=str(path.resolve()),
+                    primary_line_number=idx + 1,
+                    primary_line_content=lines[idx],
+                    context_start=start_idx + 1,
+                    context_end=end_idx + 1,
+                    context_lines=lines[start_idx : end_idx + 1],
+                    severity=severity,
+                    total_log_lines=len(lines),
+                )
+            )
+            last_end = end_idx
+
         return blocks
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _read_lines(path: Path) -> list[str]:
+        """Read file trying UTF-8 first, falling back to latin-1."""
+        for encoding in ("utf-8", "latin-1"):
+            try:
+                return path.read_text(encoding=encoding).splitlines(keepends=True)
+            except UnicodeDecodeError:
+                continue
+        raise ValueError(f"Cannot decode file: {path}")
+
+    @staticmethod
+    def _score_line(line: str) -> int:
+        """Return a severity score for a single log line (0 = not anomalous)."""
+        line_lower = line.lower()
+        best = 0
+        for pattern in ERROR_PATTERNS:
+            if pattern.search(line):
+                # Determine which keyword matched and look up its rank
+                for keyword, rank in SEVERITY_RANK.items():
+                    if keyword in line_lower:
+                        best = max(best, rank)
+                # HTTP status code pattern is a special case
+                if pattern.pattern.startswith('"'):
+                    best = max(best, SEVERITY_RANK["http_4xx_5xx"])
+        return best
+
+    def _find_all_anomalies(self, lines: list[str]) -> list[tuple[int, int]]:
+        """Return sorted list of (0-indexed line number, severity) for every anomalous line."""
+        results = []
+        for idx, line in enumerate(lines):
+            score = self._score_line(line)
+            if score > 0:
+                results.append((idx, score))
+        return results
+
+    def _find_primary_anomaly(self, lines: list[str]) -> Optional[tuple[int, int]]:
+        """
+        Return the (0-indexed line number, severity) of the single highest-severity
+        anomaly.  Ties are broken by picking the *first* occurrence.
+        """
+        anomalies = self._find_all_anomalies(lines)
+        if not anomalies:
+            return None
+        return max(anomalies, key=lambda t: t[1])

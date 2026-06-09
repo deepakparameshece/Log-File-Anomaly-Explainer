@@ -8,4 +8,24 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Test caches
 .pytest_cache/
+
+# Environment variables (secrets)
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Distribution
+*.whl
+*.tar.gz
