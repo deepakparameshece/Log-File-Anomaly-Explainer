@@ -21,6 +21,7 @@ from rich import box
 
 from src.parser import LogParser
 from src.llm_client import GeminiClient
+from src.agent import LogAnalysisAgent
 
 console = Console()
 
@@ -281,6 +282,153 @@ def _render_markdown(results: list[dict], out_file: str | None) -> None:
         console.print(f"[green]Markdown report saved to[/green] {out_file}")
     else:
         console.print(Markdown(content))
+
+
+# ---------------------------------------------------------------------------
+# `investigate` command — tool-using agent loop
+# ---------------------------------------------------------------------------
+@main.command("investigate")
+@click.argument("file", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--model",
+    "-m",
+    default="gemini-2.0-flash",
+    show_default=True,
+    help="Gemini model to use.",
+)
+@click.option(
+    "--query",
+    "-q",
+    default=None,
+    help="Optional question or context to guide the investigation.",
+)
+@click.option(
+    "--output",
+    "-o",
+    type=click.Choice(["console", "json", "markdown"], case_sensitive=False),
+    default="console",
+    show_default=True,
+    help="Output format.",
+)
+@click.option(
+    "--out-file",
+    "-f",
+    type=click.Path(dir_okay=False, writable=True),
+    default=None,
+    help="Save output to a file (works with --output json or markdown).",
+)
+def investigate(
+    file: Path,
+    model: str,
+    query: str | None,
+    output: str,
+    out_file: str | None,
+) -> None:
+    """
+    🤖 Agent mode — LLM autonomously investigates FILE using tools.
+
+    The agent iteratively calls log analysis tools (parse, scan, read lines,
+    search patterns) and reasons about the results before producing a final
+    structured analysis.
+
+    \b
+    Example:
+        log-explainer investigate app.log
+        log-explainer investigate app.log --query "focus on database errors"
+        log-explainer investigate app.log --output json --out-file report.json
+    """
+    console.print(
+        Panel.fit(
+            f"[bold magenta]🤖 Agent Investigation Mode[/bold magenta]\n"
+            f"[dim]File:[/dim] {file}\n"
+            f"[dim]Model:[/dim] {model}\n"
+            f"[dim]Query:[/dim] {query or '(auto)'}\n"
+            f"[dim]Max iterations:[/dim] 10",
+            border_style="magenta",
+        )
+    )
+
+    try:
+        agent = LogAnalysisAgent(model=model)
+    except EnvironmentError as exc:
+        console.print(f"[bold red]Configuration error:[/bold red] {exc}")
+        sys.exit(1)
+
+    # Live progress callback
+    def _on_tool_call(tool_name: str, args: dict, result: dict) -> None:
+        status = result.get("status", result.get("match_count", "done"))
+        console.print(
+            f"  [dim]→[/dim] [cyan]{tool_name}[/cyan]"
+            f"({', '.join(f'{k}={v!r}' for k, v in args.items() if k != 'file_path')})"
+            f" [dim]» {status}[/dim]"
+        )
+
+    console.print(Rule("[yellow]Agent is investigating…[/yellow]"))
+
+    with console.status("[bold green]Agent loop running…[/bold green]"):
+        result = agent.investigate(
+            log_file_path=str(file.resolve()),
+            user_query=query,
+            on_tool_call=_on_tool_call,
+        )
+
+    console.print(Rule("[bold green]Investigation Complete[/bold green]"))
+
+    # Show tool call trace
+    if result.get("tool_calls_log"):
+        trace_table = Table(
+            title="Agent Tool Call Trace",
+            box=box.ROUNDED,
+            header_style="bold cyan",
+            show_lines=True,
+        )
+        trace_table.add_column("#", justify="center", width=4)
+        trace_table.add_column("Iter", justify="center", width=5)
+        trace_table.add_column("Tool", style="cyan")
+        trace_table.add_column("Arguments", max_width=40)
+        for i, tc in enumerate(result["tool_calls_log"], 1):
+            args_str = ", ".join(
+                f"{k}={v!r}" for k, v in tc["args"].items() if k != "file_path"
+            )
+            trace_table.add_row(
+                str(i),
+                str(tc["iteration"]),
+                tc["tool"],
+                args_str or "(file only)",
+            )
+        console.print(trace_table)
+        console.print(
+            f"[dim]Completed in {result.get('iterations', '?')} iteration(s)[/dim]\n"
+        )
+
+    # Render analysis
+    results_list = [result]
+    if output == "console":
+        _render_agent_console(result)
+    elif output == "json":
+        _render_json(results_list, out_file)
+    elif output == "markdown":
+        _render_markdown(results_list, out_file)
+
+
+def _render_agent_console(r: dict) -> None:
+    """Render agent investigation results to the console."""
+    meta_table = Table(box=box.SIMPLE, show_header=False, padding=(0, 1))
+    meta_table.add_column("Key", style="dim")
+    meta_table.add_column("Value")
+    meta_table.add_row("Model", r.get("model", "N/A"))
+    meta_table.add_row("Iterations", str(r.get("iterations", "N/A")))
+    meta_table.add_row("Tool Calls", str(len(r.get("tool_calls_log", []))))
+    meta_table.add_row("Prompt Tokens", str(r.get("prompt_tokens", "N/A")))
+    console.print(meta_table)
+
+    console.print(Panel(Markdown(r.get("root_cause", "_No data_")),    title="🔍 Root Cause Analysis", border_style="red"))
+    console.print(Panel(Markdown(r.get("probable_cause", "_No data_")), title="🤔 Probable Cause",      border_style="yellow"))
+    console.print(Panel(Markdown(r.get("remediation", "_No data_")),   title="🛠  Remediation Steps",  border_style="green"))
+
+    confidence = r.get("confidence", "UNKNOWN")
+    conf_color = {"HIGH": "green", "MEDIUM": "yellow", "LOW": "red"}.get(confidence.upper(), "dim")
+    console.print(f"\n[bold]Confidence:[/bold] [{conf_color}]{confidence}[/{conf_color}]\n")
 
 
 if __name__ == "__main__":

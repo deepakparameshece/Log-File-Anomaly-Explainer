@@ -136,4 +136,88 @@ sent to the LLM:
 
 ---
 
+## 5. Tool-Using Agent System Instruction
+
+**Location:** [`src/agent.py`](src/agent.py) → `AGENT_SYSTEM_INSTRUCTION`
+
+The agent mode uses a separate system instruction that describes the available
+tools and the expected investigation workflow:
+
+```text
+You are an expert Site Reliability Engineer (SRE) agent with access to log
+analysis tools.  Your job is to investigate log files to find and explain
+anomalies.
+
+**Available tools:**
+1. **parse_log_file** — Parse a log file to find the primary (highest-severity)
+   anomaly and extract surrounding context lines.
+2. **scan_all_anomalies** — Scan the entire log and list all distinct anomaly
+   clusters with their severity scores.
+3. **read_log_lines** — Read a specific range of lines from the log file for
+   deeper inspection.
+4. **search_log_pattern** — Search the log for a regex pattern and return
+   matching lines with line numbers.
+
+**Investigation workflow:**
+1. Start by scanning the log to get an overview of all anomalies.
+2. Parse the log to get full context around the primary anomaly.
+3. If needed, read additional lines or search for related patterns to build
+   a complete picture.
+4. Once you have enough information, provide your final analysis.
+
+(Same structured output format as Section 1.)
+```
+
+### Agent Tool Declarations
+
+**Location:** [`src/agent.py`](src/agent.py) → `TOOL_DECLARATIONS`
+
+Four tools are declared as Gemini function-calling schemas:
+
+| Tool | Parameters | Description |
+|---|---|---|
+| `parse_log_file` | `file_path` (required), `context_window` (optional) | Finds the primary anomaly with ±N context lines |
+| `scan_all_anomalies` | `file_path` (required), `context_window` (optional) | Lists all distinct anomaly clusters |
+| `read_log_lines` | `file_path`, `start_line`, `end_line` (all required) | Reads a specific line range |
+| `search_log_pattern` | `file_path`, `pattern` (both required) | Regex search across the file |
+
+### Agent Loop Architecture
+
+```
+User Request
+     │
+     ▼
+┌─────────────────────────────────────────────────────┐
+│                   Agent Loop                        │
+│                                                     │
+│  ┌───────────┐    function_call?   ┌─────────────┐  │
+│  │  Gemini   │──── YES ──────────▶│  Execute    │  │
+│  │  API      │                     │  Tool       │  │
+│  │           │◀── tool result ────│  (parser,   │  │
+│  │           │                     │   scanner,  │  │
+│  │           │──── NO (text) ─┐    │   reader,   │  │
+│  └───────────┘                │    │   searcher) │  │
+│                               │    └─────────────┘  │
+│                               ▼                     │
+│                        Final Analysis               │
+│                    (max 10 iterations)               │
+└─────────────────────────────────────────────────────┘
+     │
+     ▼
+Structured Output
+(Root Cause / Probable Cause / Remediation / Confidence)
+```
+
+### Design Rationale
+
+| Decision | Reason |
+|---|---|
+| **Explicit workflow in system prompt** | Guides the agent toward a productive investigation order |
+| **4 complementary tools** | Covers overview (scan), detail (parse), drill-down (read), and discovery (search) |
+| **Max 10 iterations** | Prevents infinite loops and runaway API costs |
+| **Float-to-int casting** | Gemini sometimes returns integer args as floats; casting prevents TypeError |
+| **on_tool_call callback** | Enables live CLI progress without coupling agent to presentation |
+
+---
+
 *Last updated: 2026-06-09*
