@@ -4,14 +4,12 @@
 
 ### Team Members
 
-| # | Name | Role | Contact |
-|---|---|---|---|
-| 1 | Harish S | Lead Developer / AI Engineer | — |
+| S.No | Name |
+|---|---|
+| 1 | Harish S |
+| 2 | Deepak P |
+| 3 | Rakul A  |
+| 4 | Naveen kumar N |
 
 ---
 
-### Contribution Summary
-
-| Member | Contributions |
-|---|---|
-| **Harish S** | Architecture design, log parser, LLM integration, agent loop, CLI, testing, documentation |
