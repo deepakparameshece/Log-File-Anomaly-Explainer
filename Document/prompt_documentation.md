@@ -7,7 +7,7 @@
 
 ## 1. System Instruction (Gemini `system_instruction`)
 
-**Location:** [`src/llm_client.py`](src/llm_client.py) → `SYSTEM_INSTRUCTION`
+**Location:** [`src/llm_client.py`](../Project/src/llm_client.py) → `SYSTEM_INSTRUCTION`
 
 ```text
 You are an expert Site Reliability Engineer (SRE) and software debugging specialist.
@@ -50,7 +50,7 @@ the available context.>
 
 ## 2. User Prompt Template
 
-**Location:** [`src/llm_client.py`](src/llm_client.py) → `USER_PROMPT_TEMPLATE`
+**Location:** [`src/llm_client.py`](../Project/src/llm_client.py) → `USER_PROMPT_TEMPLATE`
 
 ```text
 ### Log File Metadata
@@ -95,7 +95,7 @@ Please analyse the above log excerpt and provide your structured response.
 
 ## 3. Error Detection Patterns
 
-**Location:** [`src/parser.py`](src/parser.py) → `ERROR_PATTERNS` and `SEVERITY_RANK`
+**Location:** [`src/parser.py`](../Project/src/parser.py) → `ERROR_PATTERNS` and `SEVERITY_RANK`
 
 The parser uses a ranked set of regex patterns to detect anomalies before any
 LLM interaction occurs. These are not prompts but directly inform what gets
@@ -138,7 +138,7 @@ sent to the LLM:
 
 ## 5. Tool-Using Agent System Instruction
 
-**Location:** [`src/agent.py`](src/agent.py) → `AGENT_SYSTEM_INSTRUCTION`
+**Location:** [`src/agent.py`](../Project/src/agent.py) → `AGENT_SYSTEM_INSTRUCTION`
 
 The agent mode uses a separate system instruction that describes the available
 tools and the expected investigation workflow:
@@ -170,7 +170,7 @@ anomalies.
 
 ### Agent Tool Declarations
 
-**Location:** [`src/agent.py`](src/agent.py) → `TOOL_DECLARATIONS`
+**Location:** [`src/agent.py`](../Project/src/agent.py) → `TOOL_DECLARATIONS`
 
 Four tools are declared as Gemini function-calling schemas:
 

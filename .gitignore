@@ -29,3 +29,6 @@ Thumbs.db
 # Distribution
 *.whl
 *.tar.gz
+
+# uv lock (optional — can be committed for reproducibility)
+# uv.lock
