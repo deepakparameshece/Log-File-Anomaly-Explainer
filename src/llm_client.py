@@ -1,69 +1,182 @@
-import json
-from pydantic import BaseModel, Field
-import ollama
+"""
+LLM Client Module
+=================
+Packages the extracted anomaly context into a structured prompt and sends it
+to the Google Gemini API (free tier) using the modern ``google-genai`` SDK.
+Returns a structured analysis dict.
+"""
 
-class ErrorAnalysis(BaseModel):
-    identified_error: str = Field(description="The exact error that occurred.")
-    probable_cause: str = Field(description="The probable root cause.")
-    suggested_fix: str = Field(description="Suggested steps to fix the issue.")
-    needs_more_info: bool = Field(description="True if the log snippet is ambiguous and you cannot determine the root cause, requiring internal KB.")
+from __future__ import annotations
 
-class OllamaClient:
-    def __init__(self, model_name: str = "llama3"):
-        self.model_name = model_name
-        self.system_prompt = """You are an expert Senior DevOps Engineer and Site Reliability Engineer. 
-Your task is to analyze the following extracted log snippet, which contains an error along with its surrounding context.
-Analyze the log block to determine the exact error, probable root cause, and suggested fix.
-If the log snippet is ambiguous and you cannot determine the root cause, set "needs_more_info" to true."""
+import os
+import textwrap
+from typing import Any
 
-    def analyze_log(self, log_content: str) -> ErrorAnalysis:
-        prompt = f"Please analyze this log extract.\n\n### Log Extract\n{log_content}"
-        
-        response = ollama.chat(
-            model=self.model_name,
-            messages=[
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": prompt}
-            ],
-            format=ErrorAnalysis.model_json_schema()
-        )
-        
-        try:
-            return ErrorAnalysis.model_validate_json(response["message"]["content"])
-        except Exception:
-            # Fallback if parsing fails
-            return ErrorAnalysis(
-                identified_error="Parse failed",
-                probable_cause="LLM returned invalid JSON structure.",
-                suggested_fix="Try again or check LLM output.",
-                needs_more_info=False
+from google import genai
+from google.genai import types
+from dotenv import load_dotenv
+
+from src.parser import AnomalyBlock
+
+# ---------------------------------------------------------------------------
+# Load environment variables from .env (if present)
+# ---------------------------------------------------------------------------
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Prompt Templates (documented in prompt_documentation.md)
+# ---------------------------------------------------------------------------
+
+SYSTEM_INSTRUCTION = textwrap.dedent("""\
+    You are an expert Site Reliability Engineer (SRE) and software debugging specialist.
+    Your task is to analyse a section of a log file that contains an error or anomaly.
+
+    You will receive:
+    1. Metadata about the log file (path, line numbers, severity).
+    2. A context window of log lines (±20 lines around the primary error), with the
+       primary error line highlighted by ">>>" at the start of its row.
+
+    You must respond in the following EXACT structured format (no extra prose outside
+    the sections below):
+
+    ## Root Cause Analysis
+    <One concise paragraph explaining the technical root cause of the error.>
+
+    ## Probable Cause
+    <One concise paragraph explaining WHY this error likely occurred, referencing
+    specific lines or values from the provided context.>
+
+    ## Remediation Steps
+    <A numbered list of 3–6 actionable steps an on-call engineer can take immediately
+    to diagnose, mitigate, or permanently fix this issue.>
+
+    ## Confidence
+    <A single word: HIGH / MEDIUM / LOW — your confidence in the above analysis given
+    the available context.>
+""")
+
+USER_PROMPT_TEMPLATE = textwrap.dedent("""\
+    ### Log File Metadata
+    - **File:** {file_path}
+    - **Total lines in file:** {total_lines}
+    - **Primary anomaly at line:** {primary_line} (marked with >>>)
+    - **Context window:** lines {context_start} – {context_end}
+    - **Detected severity score:** {severity}/6
+
+    ### Primary Error Line
+    ```
+    {primary_line_content}
+    ```
+
+    ### Context Window (±20 lines)
+    ```
+    {formatted_context}
+    ```
+
+    Please analyse the above log excerpt and provide your structured response.
+""")
+
+
+# ---------------------------------------------------------------------------
+# LLM Client
+# ---------------------------------------------------------------------------
+class GeminiClient:
+    """
+    Thin wrapper around the Google GenAI SDK targeting the Gemini 2.0 Flash
+    model (free tier).  Falls back gracefully if the API key is missing.
+    """
+
+    DEFAULT_MODEL = "gemini-2.0-flash"
+
+    def __init__(self, api_key: str | None = None, model: str | None = None) -> None:
+        self.api_key = api_key or os.getenv("GEMINI_API_KEY")
+        if not self.api_key:
+            raise EnvironmentError(
+                "GEMINI_API_KEY is not set.  "
+                "Add it to your .env file or export it as an environment variable."
             )
+        self._client = genai.Client(api_key=self.api_key)
+        self.model_name = model or self.DEFAULT_MODEL
 
-    def refine_analysis(self, log_content: str, kb_info: str) -> ErrorAnalysis:
-        prompt = f"""The previous analysis was ambiguous. Here is some internal documentation from our Knowledge Base related to similar errors.
-Use this to refine your analysis.
-
-### Internal Knowledge Base Info
-{kb_info}
-
-### Log Extract
-{log_content}"""
-
-        response = ollama.chat(
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def explain(self, block: AnomalyBlock) -> dict[str, Any]:
+        """
+        Send the AnomalyBlock to Gemini and return a structured dict with keys:
+          - raw_response  : full LLM text
+          - root_cause    : extracted section
+          - probable_cause: extracted section
+          - remediation   : extracted section
+          - confidence    : HIGH / MEDIUM / LOW
+          - model         : model name used
+          - prompt_tokens : approximate token count (if available)
+        """
+        prompt = self._build_prompt(block)
+        response = self._client.models.generate_content(
             model=self.model_name,
-            messages=[
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": prompt}
-            ],
-            format=ErrorAnalysis.model_json_schema()
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_INSTRUCTION,
+            ),
         )
-        
+        raw = response.text
+        parsed = self._parse_response(raw)
+        parsed["raw_response"] = raw
+        parsed["model"] = self.model_name
+        # Extract usage metadata if available
         try:
-            return ErrorAnalysis.model_validate_json(response["message"]["content"])
-        except Exception:
-            return ErrorAnalysis(
-                identified_error="Parse failed on refinement",
-                probable_cause="LLM returned invalid JSON structure.",
-                suggested_fix="Try again or check LLM output.",
-                needs_more_info=False
-            )
+            parsed["prompt_tokens"] = response.usage_metadata.prompt_token_count
+        except AttributeError:
+            parsed["prompt_tokens"] = None
+        return parsed
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+    def _build_prompt(self, block: AnomalyBlock) -> str:
+        return USER_PROMPT_TEMPLATE.format(
+            file_path=block.file_path,
+            total_lines=block.total_log_lines,
+            primary_line=block.primary_line_number,
+            context_start=block.context_start,
+            context_end=block.context_end,
+            severity=block.severity,
+            primary_line_content=block.primary_line_content.strip(),
+            formatted_context=block.formatted_context,
+        )
+
+    @staticmethod
+    def _parse_response(text: str) -> dict[str, str]:
+        """Extract the four structured sections from the LLM response."""
+        sections: dict[str, str] = {
+            "root_cause": "",
+            "probable_cause": "",
+            "remediation": "",
+            "confidence": "UNKNOWN",
+        }
+
+        # Simple section splitter based on the markdown headers we instruct the model to use
+        markers = {
+            "root_cause": "## Root Cause Analysis",
+            "probable_cause": "## Probable Cause",
+            "remediation": "## Remediation Steps",
+            "confidence": "## Confidence",
+        }
+
+        for key, header in markers.items():
+            start = text.find(header)
+            if start == -1:
+                continue
+            content_start = start + len(header)
+            # Find the next section header
+            next_header_pos = len(text)
+            for other_key, other_header in markers.items():
+                if other_key == key:
+                    continue
+                pos = text.find(other_header, content_start)
+                if pos != -1 and pos < next_header_pos:
+                    next_header_pos = pos
+            sections[key] = text[content_start:next_header_pos].strip()
+
+        return sections
